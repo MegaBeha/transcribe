@@ -4,7 +4,8 @@
 
 После запуска скрипт:
 - берёт API-ключ из переменной окружения `OPENAI_API_KEY`;
-- отправляет аудио в модель `gpt-4o-mini-transcribe`;
+- по умолчанию отправляет аудио в модель `gpt-4o-mini-transcribe`;
+- при ключе `-WithDiarization` отправляет аудио в `gpt-4o-transcribe` с включённой диаризацией;
 - сохраняет результат в `.txt` рядом с исходным файлом.
 
 Например: `meeting.mp3` → `meeting.txt`.
@@ -60,6 +61,12 @@ $env:OPENAI_API_KEY
 
 ```powershell
 ./transcribe.ps1 ./audio/example.mp3
+```
+
+С диаризацией (распознавание с разделением по спикерам):
+
+```powershell
+./transcribe.ps1 ./audio/example.mp3 -WithDiarization
 ```
 
 Если скрипты запрещены политикой выполнения, можно запустить так:

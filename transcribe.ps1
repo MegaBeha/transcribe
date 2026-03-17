@@ -2,7 +2,12 @@ param(
     # Relative or absolute path to the source audio file that should be transcribed.
     # The script currently validates that this file uses the .mp3 extension.
     [Parameter(Mandatory = $true, Position = 0)]
-    [string]$InputFile
+    [string]$InputFile,
+
+    # Optional switch: send audio to a diarization-capable model.
+    # Useful for meetings/interviews where speaker separation is needed.
+    [Parameter(Mandatory = $false)]
+    [switch]$WithDiarization
 )
 
 # Fail fast on any non-terminating error so that we do not silently continue
@@ -39,6 +44,10 @@ try {
     $outputFile = [System.IO.Path]::ChangeExtension($fullInputPath, ".txt")
     $fileName = [System.IO.Path]::GetFileName($fullInputPath)
 
+    # Use a default lightweight model, but allow an explicit diarization mode.
+    # This keeps default cost/performance behavior unchanged for existing users.
+    $model = if ($WithDiarization) { "gpt-4o-transcribe" } else { "gpt-4o-mini-transcribe" }
+
     # Ensure System.Net.Http types are available in the current PowerShell session.
     Add-Type -AssemblyName System.Net.Http
 
@@ -64,9 +73,14 @@ try {
 
         # Add the required file part and additional transcription parameters.
         $multipart.Add($fileContent, "file", $fileName)
-        $multipart.Add([System.Net.Http.StringContent]::new("gpt-4o-mini-transcribe"), "model")
+        $multipart.Add([System.Net.Http.StringContent]::new($model), "model")
         $multipart.Add([System.Net.Http.StringContent]::new("ru"), "language")
         $multipart.Add([System.Net.Http.StringContent]::new("auto"), "chunking_strategy")
+
+        # Request diarization only when the dedicated mode is enabled.
+        if ($WithDiarization) {
+            $multipart.Add([System.Net.Http.StringContent]::new("true"), "diarization")
+        }
 
         # Execute the request synchronously for script simplicity.
         # GetAwaiter().GetResult() bridges async .NET APIs into PowerShell script flow.
@@ -90,7 +104,8 @@ try {
         # Save transcript using UTF-8 encoding so Cyrillic and other Unicode
         # characters are preserved in the resulting .txt file.
         [System.IO.File]::WriteAllText($outputFile, $json.text, [System.Text.Encoding]::UTF8)
-        Write-Host "Done: $outputFile"
+        $modeLabel = if ($WithDiarization) { "режим с диаризацией" } else { "обычный режим" }
+        Write-Host "Done: $outputFile ($modeLabel, model=$model)"
     }
     finally {
         # Always release disposable resources, even if request/parsing fails.
