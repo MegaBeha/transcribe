@@ -69,6 +69,14 @@ $env:OPENAI_API_KEY
 ./transcribe.ps1 ./audio/example.mp3 -WithDiarization
 ```
 
+Также поддерживаются короткие/альтернативные ключи:
+
+```powershell
+./transcribe.ps1 ./audio/example.mp3 -Diarization
+./transcribe.ps1 ./audio/example.mp3 -SpeakerDiarization
+./transcribe.ps1 ./audio/example.mp3 -wd
+```
+
 Если скрипты запрещены политикой выполнения, можно запустить так:
 
 ```powershell

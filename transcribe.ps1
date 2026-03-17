@@ -7,7 +7,13 @@ param(
     # Optional switch: send audio to a diarization-capable model.
     # Useful for meetings/interviews where speaker separation is needed.
     [Parameter(Mandatory = $false)]
-    [switch]$WithDiarization
+    [Alias("Diarization", "SpeakerDiarization", "wd")]
+    [switch]$WithDiarization,
+
+    # Backward/CLI compatibility: allow extra trailing args and interpret
+    # common diarization flags manually (e.g. when users pass them as plain args).
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$AdditionalArgs
 )
 
 # Fail fast on any non-terminating error so that we do not silently continue
@@ -15,6 +21,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 try {
+    # Tolerate diarization flags passed as free-form arguments.
+    # This helps when users copy commands from terminals where line wrapping
+    # or shell specifics may alter how a switch is tokenized.
+    if (-not $WithDiarization -and $AdditionalArgs) {
+        $normalizedArgs = $AdditionalArgs | ForEach-Object { $_.Trim() }
+        if ($normalizedArgs -contains "-WithDiarization" -or
+            $normalizedArgs -contains "--with-diarization" -or
+            $normalizedArgs -contains "-Diarization") {
+            $WithDiarization = $true
+        }
+    }
+
     # Verify that the user-provided path exists before resolving it.
     # Using -LiteralPath avoids wildcard expansion and treats the string as-is.
     if (-not (Test-Path -LiteralPath $InputFile)) {
