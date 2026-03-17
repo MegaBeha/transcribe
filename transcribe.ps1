@@ -1,4 +1,4 @@
-param(
+﻿param(
     # Relative or absolute path to the source audio file that should be transcribed.
     # The script currently validates that this file uses the .mp3 extension.
     [Parameter(Mandatory = $true, Position = 0)]
@@ -28,7 +28,7 @@ function Get-AudioDurationSeconds {
 
     $ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
     if (-not $ffprobe) {
-        throw "Для проверки длительности при диаризации нужен ffprobe (часть ffmpeg), но он не найден в PATH"
+        throw "ffprobe (part of ffmpeg) is required to validate duration in diarization mode, but it was not found in PATH"
     }
 
     $probeArgs = @(
@@ -40,12 +40,12 @@ function Get-AudioDurationSeconds {
 
     $durationRaw = & $ffprobe.Source @probeArgs
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($durationRaw)) {
-        throw "Не удалось определить длительность аудио через ffprobe"
+        throw "Failed to detect audio duration via ffprobe"
     }
 
     $duration = 0.0
     if (-not [double]::TryParse($durationRaw.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$duration)) {
-        throw "ffprobe вернул некорректную длительность: '$durationRaw'"
+        throw "ffprobe returned an invalid duration: '$durationRaw'"
     }
 
     return $duration
@@ -65,7 +65,7 @@ function Split-AudioIntoChunks {
 
     $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
     if (-not $ffmpeg) {
-        throw "Для разрезания длинного аудио при диаризации нужен ffmpeg, но он не найден в PATH"
+        throw "ffmpeg is required to split long audio in diarization mode, but it was not found in PATH"
     }
 
     $inputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
@@ -83,12 +83,12 @@ function Split-AudioIntoChunks {
 
     & $ffmpeg.Source @ffmpegArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "Не удалось разрезать аудио на части через ffmpeg"
+        throw "Failed to split audio into chunks via ffmpeg"
     }
 
     $chunks = Get-ChildItem -LiteralPath $TempDirectory -File | Sort-Object Name
     if (-not $chunks -or $chunks.Count -eq 0) {
-        throw "ffmpeg не создал части аудио"
+        throw "ffmpeg did not produce any audio chunks"
     }
 
     return $chunks
@@ -135,7 +135,7 @@ function Invoke-Transcription {
         $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         if (-not $response.IsSuccessStatusCode) {
             $chunkInfo = if ([string]::IsNullOrWhiteSpace($ChunkLabel)) { "" } else { " ($ChunkLabel)" }
-            throw "API error$chunkInfo: HTTP $([int]$response.StatusCode)`n$responseBody"
+            throw "API error${chunkInfo}: HTTP $([int]$response.StatusCode)`n$responseBody"
         }
 
         $json = $responseBody | ConvertFrom-Json
@@ -220,8 +220,8 @@ try {
                 $chunks = Split-AudioIntoChunks -InputPath $fullInputPath -MaxChunkDuration $maxDiarizationDurationSeconds -TempDirectory $tempDir
                 for ($i = 0; $i -lt $chunks.Count; $i++) {
                     $chunk = $chunks[$i]
-                    $chunkLabel = "часть {0}/{1}" -f ($i + 1), $chunks.Count
-                    Write-Host "Отправка: $chunkLabel ($($chunk.Name))"
+                    $chunkLabel = "chunk {0}/{1}" -f ($i + 1), $chunks.Count
+                    Write-Host "Uploading: $chunkLabel ($($chunk.Name))"
                     $chunkText = Invoke-Transcription -HttpClient $httpClient -AudioPath $chunk.FullName -Model $model -WithDiarization $true -ChunkLabel $chunkLabel
                     $allTexts.Add($chunkText)
                 }
@@ -238,7 +238,7 @@ try {
 
         $finalText = [string]::Join([Environment]::NewLine + [Environment]::NewLine, $allTexts)
         [System.IO.File]::WriteAllText($outputFile, $finalText, [System.Text.Encoding]::UTF8)
-        $modeLabel = if ($WithDiarization) { "режим с диаризацией" } else { "обычный режим" }
+        $modeLabel = if ($WithDiarization) { "diarization mode" } else { "standard mode" }
         Write-Host "Done: $outputFile ($modeLabel, model=$model)"
     }
     finally {
