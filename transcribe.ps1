@@ -20,6 +20,137 @@ param(
 # after partial failures (for example, network issues or malformed JSON).
 $ErrorActionPreference = "Stop"
 
+function Get-AudioDurationSeconds {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath
+    )
+
+    $ffprobe = Get-Command ffprobe -ErrorAction SilentlyContinue
+    if (-not $ffprobe) {
+        throw "Для проверки длительности при диаризации нужен ffprobe (часть ffmpeg), но он не найден в PATH"
+    }
+
+    $probeArgs = @(
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        $FilePath
+    )
+
+    $durationRaw = & $ffprobe.Source @probeArgs
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($durationRaw)) {
+        throw "Не удалось определить длительность аудио через ffprobe"
+    }
+
+    $duration = 0.0
+    if (-not [double]::TryParse($durationRaw.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$duration)) {
+        throw "ffprobe вернул некорректную длительность: '$durationRaw'"
+    }
+
+    return $duration
+}
+
+function Split-AudioIntoChunks {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InputPath,
+
+        [Parameter(Mandatory = $true)]
+        [double]$MaxChunkDuration,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectory
+    )
+
+    $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
+    if (-not $ffmpeg) {
+        throw "Для разрезания длинного аудио при диаризации нужен ffmpeg, но он не найден в PATH"
+    }
+
+    $inputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
+    $outputPattern = Join-Path $TempDirectory ("{0}_part_%03d.mp3" -f $inputBaseName)
+
+    $ffmpegArgs = @(
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", $InputPath,
+        "-f", "segment",
+        "-segment_time", ([string]$MaxChunkDuration),
+        "-c", "copy",
+        $outputPattern
+    )
+
+    & $ffmpeg.Source @ffmpegArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Не удалось разрезать аудио на части через ffmpeg"
+    }
+
+    $chunks = Get-ChildItem -LiteralPath $TempDirectory -File | Sort-Object Name
+    if (-not $chunks -or $chunks.Count -eq 0) {
+        throw "ffmpeg не создал части аудио"
+    }
+
+    return $chunks
+}
+
+function Invoke-Transcription {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Net.Http.HttpClient]$HttpClient,
+
+        [Parameter(Mandatory = $true)]
+        [string]$AudioPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Model,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$WithDiarization,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ChunkLabel
+    )
+
+    $multipart = [System.Net.Http.MultipartFormDataContent]::new()
+    $fileStream = $null
+
+    try {
+        $fileStream = [System.IO.File]::OpenRead($AudioPath)
+        $fileName = [System.IO.Path]::GetFileName($AudioPath)
+
+        $fileContent = [System.Net.Http.StreamContent]::new($fileStream)
+        $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new("audio/mpeg")
+
+        $multipart.Add($fileContent, "file", $fileName)
+        $multipart.Add([System.Net.Http.StringContent]::new($Model), "model")
+        $multipart.Add([System.Net.Http.StringContent]::new("ru"), "language")
+        $multipart.Add([System.Net.Http.StringContent]::new("auto"), "chunking_strategy")
+
+        if ($WithDiarization) {
+            $multipart.Add([System.Net.Http.StringContent]::new("true"), "diarization")
+        }
+
+        $response = $HttpClient.PostAsync("https://api.openai.com/v1/audio/transcriptions", $multipart).GetAwaiter().GetResult()
+        $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            $chunkInfo = if ([string]::IsNullOrWhiteSpace($ChunkLabel)) { "" } else { " ($ChunkLabel)" }
+            throw "API error$chunkInfo: HTTP $([int]$response.StatusCode)`n$responseBody"
+        }
+
+        $json = $responseBody | ConvertFrom-Json
+        if ([string]::IsNullOrWhiteSpace($json.text)) {
+            throw "API response does not contain 'text'`n$responseBody"
+        }
+
+        return $json.text
+    }
+    finally {
+        if ($fileStream) { $fileStream.Dispose() }
+        if ($multipart) { $multipart.Dispose() }
+    }
+}
+
 try {
     # Tolerate diarization flags passed as free-form arguments.
     # This helps when users copy commands from terminals where line wrapping
@@ -60,7 +191,7 @@ try {
     # Generate an output text file path in the same directory as the source file.
     # Example: meeting.mp3 -> meeting.txt
     $outputFile = [System.IO.Path]::ChangeExtension($fullInputPath, ".txt")
-    $fileName = [System.IO.Path]::GetFileName($fullInputPath)
+    $maxDiarizationDurationSeconds = 1400.0
 
     # Use a default lightweight model, but allow an explicit diarization mode.
     # This keeps default cost/performance behavior unchanged for existing users.
@@ -75,61 +206,45 @@ try {
     $httpClient.DefaultRequestHeaders.Authorization =
         [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $apiKey)
 
-    # Build a multipart/form-data request body expected by
-    # /v1/audio/transcriptions: audio file + model/options fields.
-    $multipart = [System.Net.Http.MultipartFormDataContent]::new()
-
-    # Open the file as a stream to avoid loading the entire MP3 into memory.
-    # This is especially important for larger recordings.
-    $fileStream = [System.IO.File]::OpenRead($fullInputPath)
-
+    $tempDir = $null
     try {
-        # Wrap the stream in HTTP content and explicitly set media type so
-        # the server can correctly interpret the uploaded binary payload.
-        $fileContent = [System.Net.Http.StreamContent]::new($fileStream)
-        $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::new("audio/mpeg")
+        $allTexts = [System.Collections.Generic.List[string]]::new()
 
-        # Add the required file part and additional transcription parameters.
-        $multipart.Add($fileContent, "file", $fileName)
-        $multipart.Add([System.Net.Http.StringContent]::new($model), "model")
-        $multipart.Add([System.Net.Http.StringContent]::new("ru"), "language")
-        $multipart.Add([System.Net.Http.StringContent]::new("auto"), "chunking_strategy")
-
-        # Request diarization only when the dedicated mode is enabled.
         if ($WithDiarization) {
-            $multipart.Add([System.Net.Http.StringContent]::new("true"), "diarization")
+            $duration = Get-AudioDurationSeconds -FilePath $fullInputPath
+
+            if ($duration -gt $maxDiarizationDurationSeconds) {
+                $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N"))
+                [System.IO.Directory]::CreateDirectory($tempDir) | Out-Null
+
+                $chunks = Split-AudioIntoChunks -InputPath $fullInputPath -MaxChunkDuration $maxDiarizationDurationSeconds -TempDirectory $tempDir
+                for ($i = 0; $i -lt $chunks.Count; $i++) {
+                    $chunk = $chunks[$i]
+                    $chunkLabel = "часть {0}/{1}" -f ($i + 1), $chunks.Count
+                    Write-Host "Отправка: $chunkLabel ($($chunk.Name))"
+                    $chunkText = Invoke-Transcription -HttpClient $httpClient -AudioPath $chunk.FullName -Model $model -WithDiarization $true -ChunkLabel $chunkLabel
+                    $allTexts.Add($chunkText)
+                }
+            }
+            else {
+                $singleText = Invoke-Transcription -HttpClient $httpClient -AudioPath $fullInputPath -Model $model -WithDiarization $true
+                $allTexts.Add($singleText)
+            }
+        }
+        else {
+            $singleText = Invoke-Transcription -HttpClient $httpClient -AudioPath $fullInputPath -Model $model -WithDiarization $false
+            $allTexts.Add($singleText)
         }
 
-        # Execute the request synchronously for script simplicity.
-        # GetAwaiter().GetResult() bridges async .NET APIs into PowerShell script flow.
-        $response = $httpClient.PostAsync("https://api.openai.com/v1/audio/transcriptions", $multipart).GetAwaiter().GetResult()
-        $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-
-        # Provide the raw response body in error cases to simplify debugging
-        # (e.g., invalid API key, unsupported file, rate limiting).
-        if (-not $response.IsSuccessStatusCode) {
-            throw "API error: HTTP $([int]$response.StatusCode)`n$responseBody"
-        }
-
-        # Parse JSON response and extract the transcript text field.
-        $json = $responseBody | ConvertFrom-Json
-
-        # Fail explicitly if API contract changes or text is unexpectedly absent.
-        if ([string]::IsNullOrWhiteSpace($json.text)) {
-            throw "API response does not contain 'text'`n$responseBody"
-        }
-
-        # Save transcript using UTF-8 encoding so Cyrillic and other Unicode
-        # characters are preserved in the resulting .txt file.
-        [System.IO.File]::WriteAllText($outputFile, $json.text, [System.Text.Encoding]::UTF8)
+        $finalText = [string]::Join([Environment]::NewLine + [Environment]::NewLine, $allTexts)
+        [System.IO.File]::WriteAllText($outputFile, $finalText, [System.Text.Encoding]::UTF8)
         $modeLabel = if ($WithDiarization) { "режим с диаризацией" } else { "обычный режим" }
         Write-Host "Done: $outputFile ($modeLabel, model=$model)"
     }
     finally {
-        # Always release disposable resources, even if request/parsing fails.
-        # This prevents file locks and socket/resource leaks in repeated runs.
-        if ($fileStream) { $fileStream.Dispose() }
-        if ($multipart) { $multipart.Dispose() }
+        if ($tempDir -and (Test-Path -LiteralPath $tempDir)) {
+            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
         if ($httpClient) { $httpClient.Dispose() }
     }
 }
