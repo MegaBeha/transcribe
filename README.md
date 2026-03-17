@@ -3,7 +3,6 @@
 `transcribe` — это небольшой PowerShell-скрипт для автоматической расшифровки (транскрибации) аудиофайлов `.mp3` в текст через OpenAI Audio Transcriptions API.
 
 После запуска скрипт:
-- проверяет, что входной файл существует и имеет расширение `.mp3`;
 - берёт API-ключ из переменной окружения `OPENAI_API_KEY`;
 - отправляет аудио в модель `gpt-4o-mini-transcribe`;
 - сохраняет результат в `.txt` рядом с исходным файлом.
@@ -20,28 +19,6 @@
 - Доступ в интернет
 - API-ключ OpenAI
 - Аудиофайл в формате **`.mp3`**
-
----
-
-## Быстрый запуск
-
-Из папки проекта:
-
-```powershell
-./transcribe.ps1 ./audio/example.mp3
-```
-
-Если скрипты запрещены политикой выполнения, можно запустить так:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\transcribe.ps1 .\audio\example.mp3
-```
-
-или для PowerShell 7:
-
-```powershell
-pwsh -ExecutionPolicy Bypass -File ./transcribe.ps1 ./audio/example.mp3
-```
 
 ---
 
@@ -77,34 +54,24 @@ $env:OPENAI_API_KEY
 $env:OPENAI_API_KEY
 ```
 
-### macOS / Linux (bash, zsh)
+## Быстрый запуск
 
-Временный вариант (до закрытия терминала):
-
-```bash
-export OPENAI_API_KEY="ваш_токен_здесь"
-```
-
-Проверка:
-
-```bash
-echo "$OPENAI_API_KEY"
-```
-
-Чтобы сделать переменную постоянной, добавьте команду `export` в `~/.bashrc`, `~/.zshrc` или другой файл инициализации вашей оболочки.
-
----
-
-## Пример полного сценария (Windows PowerShell)
+Из папки проекта:
 
 ```powershell
-# 1) Один раз задаём переменную среды
-$env:OPENAI_API_KEY = "ваш_токен_здесь"
+./transcribe.ps1 ./audio/example.mp3
+```
 
-# 2) Запускаем транскрибацию
-./transcribe.ps1 .\records\interview.mp3
+Если скрипты запрещены политикой выполнения, можно запустить так:
 
-# 3) Получаем файл .\records\interview.txt
+```powershell
+powershell -ExecutionPolicy Bypass -File .\transcribe.ps1 .\audio\example.mp3
+```
+
+или для PowerShell 7:
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File ./transcribe.ps1 ./audio/example.mp3
 ```
 
 ---
@@ -121,9 +88,3 @@ $env:OPENAI_API_KEY = "ваш_токен_здесь"
   Неверный путь к входному аудиофайлу.
 
 ---
-
-## Безопасность
-
-- Не храните токен прямо в коде.
-- Не коммитьте токен в Git.
-- При случайной утечке токена — немедленно перевыпустите (rotate) ключ.
