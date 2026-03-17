@@ -191,7 +191,11 @@ try {
     # Generate an output text file path in the same directory as the source file.
     # Example: meeting.mp3 -> meeting.txt
     $outputFile = [System.IO.Path]::ChangeExtension($fullInputPath, ".txt")
+    # API hard limit for diarization-enabled requests.
     $maxDiarizationDurationSeconds = 1400.0
+    # Keep chunk duration slightly below the API limit to avoid boundary/rounding
+    # drift (e.g. 1400.004s) when ffmpeg creates segments.
+    $safeChunkDurationSeconds = 1390.0
 
     # Use a default lightweight model, but allow an explicit diarization mode.
     # This keeps default cost/performance behavior unchanged for existing users.
@@ -217,7 +221,7 @@ try {
                 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N"))
                 [System.IO.Directory]::CreateDirectory($tempDir) | Out-Null
 
-                $chunks = Split-AudioIntoChunks -InputPath $fullInputPath -MaxChunkDuration $maxDiarizationDurationSeconds -TempDirectory $tempDir
+                $chunks = Split-AudioIntoChunks -InputPath $fullInputPath -MaxChunkDuration $safeChunkDurationSeconds -TempDirectory $tempDir
                 for ($i = 0; $i -lt $chunks.Count; $i++) {
                     $chunk = $chunks[$i]
                     $chunkLabel = "chunk {0}/{1}" -f ($i + 1), $chunks.Count
