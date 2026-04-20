@@ -1,0 +1,15 @@
+# Transcription outputs
+*.txt
+
+# Audio and playlist artifacts
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.ts
+*.m3u8
+
+# Backup and temporary files
+*.bak
+*.tmp
+*.log

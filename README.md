@@ -1,35 +1,36 @@
 # transcribe
 
-`transcribe` — это небольшой PowerShell-скрипт для автоматической расшифровки (транскрибации) аудиофайлов `.mp3` в текст через OpenAI Audio Transcriptions API.
+`pipeline.ps1` — основное решение в этом дистрибутиве. Скрипт принимает один входной аргумент и сам определяет, что ему передали: URL веб-страницы, URL `m3u8`-плейлиста или локальный `.mp3`-файл. На выходе он всегда создаёт текстовую расшифровку в `.txt` и печатает путь к этому файлу в `stdout`.
 
-После запуска скрипт:
-- берёт API-ключ из переменной окружения `OPENAI_API_KEY`;
-- по умолчанию отправляет аудио в модель `gpt-4o-mini-transcribe`;
-- при ключе `-WithDiarization` отправляет аудио в `gpt-4o-transcribe` с включённой диаризацией;
-- сохраняет результат в `.txt` рядом с исходным файлом.
+Маршрутизация выполняется автоматически:
+- страница -> извлечение плейлиста -> подготовка аудио -> транскрибация;
+- плейлист -> подготовка аудио -> транскрибация;
+- `.mp3` -> сразу транскрибация.
 
-Например: `meeting.mp3` → `meeting.txt`.
+Если `pipeline.ps1` сам создаёт промежуточный `.mp3`, после успешной расшифровки этот файл удаляется. Если на вход подан пользовательский `.mp3`, он не удаляется.
+Во время долгих операций скрипты показывают подробный этапный вывод и прогресс по основным фазам выполнения.
 
----
+## Настройка окружения
 
-## Требования
+### Требования
 
-- **PowerShell**:
-  - Windows PowerShell 5.1+ или
-  - PowerShell 7+
-- Доступ в интернет
-- API-ключ OpenAI
-- Аудиофайл в формате **`.mp3`**
+- Windows PowerShell 5.1+ или PowerShell 7+
+- доступ в интернет
+- `ffmpeg` и `ffprobe` в `PATH` для сценариев, где входом является URL плейлиста или страницы
+- `python` в `PATH`, модуль `playwright`, Google Chrome или Microsoft Edge для сценариев, где входом является URL веб-страницы
+- переменная окружения `OPENAI_API_KEY` для транскрибации
 
----
+Установка `playwright` при необходимости:
 
-## Как правильно добавить токен в переменную окружения
+```powershell
+python -m pip install playwright
+```
 
-Скрипт читает ключ **только** из переменной `OPENAI_API_KEY`.
+### Переменная `OPENAI_API_KEY`
 
-### Windows (PowerShell) — на текущую сессию
+Скрипт `transcribe.ps1`, который используется внутри пайплайна, читает API-ключ только из переменной окружения `OPENAI_API_KEY`.
 
-Подходит для разового запуска в открытом окне терминала:
+На текущую PowerShell-сессию:
 
 ```powershell
 $env:OPENAI_API_KEY = "ваш_токен_здесь"
@@ -41,65 +42,113 @@ $env:OPENAI_API_KEY = "ваш_токен_здесь"
 $env:OPENAI_API_KEY
 ```
 
-> После закрытия окна терминала значение исчезнет.
-
-### Windows (PowerShell) — на постоянной основе для пользователя
+На постоянной основе для пользователя:
 
 ```powershell
 [Environment]::SetEnvironmentVariable("OPENAI_API_KEY", "ваш_токен_здесь", "User")
 ```
 
-После этого **перезапустите терминал** и проверьте:
+После этого перезапустите терминал и снова проверьте:
 
 ```powershell
 $env:OPENAI_API_KEY
 ```
 
-## Быстрый запуск
+## Запуск `pipeline.ps1`
 
-Из папки проекта:
+Если URL содержит символы `&`, передавайте ссылку в кавычках. Иначе PowerShell может интерпретировать такую строку некорректно.
 
-```powershell
-./transcribe.ps1 ./audio/example.mp3
-```
-
-С диаризацией (распознавание с разделением по спикерам):
+Вход — URL веб-страницы:
 
 ```powershell
-./transcribe.ps1 ./audio/example.mp3 -WithDiarization
+./pipeline.ps1 "https://example.com/video-page"
 ```
 
-Также поддерживаются короткие/альтернативные ключи:
+Вход — URL `m3u8`-плейлиста:
 
 ```powershell
-./transcribe.ps1 ./audio/example.mp3 -Diarization
-./transcribe.ps1 ./audio/example.mp3 -SpeakerDiarization
-./transcribe.ps1 ./audio/example.mp3 -wd
+./pipeline.ps1 "https://example.com/video.m3u8"
 ```
 
-Если скрипты запрещены политикой выполнения, можно запустить так:
+Вход — локальный `.mp3`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\transcribe.ps1 .\audio\example.mp3
+./pipeline.ps1 .\audio\example.mp3
 ```
 
-или для PowerShell 7:
+Результат:
+- на диске создаётся итоговый `.txt`;
+- путь к `.txt` печатается в `stdout`;
+- если `pipeline.ps1` сам создал промежуточный `.mp3`, этот файл удаляется после успеха.
+- во время выполнения на экране отображаются этапы работы и фазовый прогресс.
+
+## Файлы дистрибутива
+
+### `pipeline.ps1`
+
+Главный входной скрипт дистрибутива.
+
+Вход:
+- URL веб-страницы;
+- URL `m3u8`-плейлиста;
+- путь к локальному `.mp3`-файлу.
+
+Выход:
+- итоговый `.txt`-файл;
+- путь к итоговому `.txt` в `stdout`.
+
+Минимальный запуск:
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File ./transcribe.ps1 ./audio/example.mp3
+./pipeline.ps1 "https://example.com/video-page"
 ```
 
----
+### `extract-playlist.ps1`
 
-## Возможные ошибки
+Служебный скрипт для извлечения `master m3u8` со страницы с видеоплеером.
 
-- `Environment variable OPENAI_API_KEY is not set`  
-  Не задан API-ключ в переменной окружения.
+Вход:
+- URL веб-страницы.
 
-- `Expected .mp3 file, got: ...`  
-  Передан файл не в формате `.mp3`.
+Выход:
+- один URL `master m3u8` в `stdout`.
 
-- `Input file not found: ...`  
-  Неверный путь к входному аудиофайлу.
+Минимальный запуск:
 
----
+```powershell
+./extract-playlist.ps1 "https://example.com/video-page"
+```
+
+### `prepare-audio.ps1`
+
+Служебный скрипт для получения аудио из HLS-плейлиста и сохранения его в `.mp3`.
+
+Вход:
+- URL `m3u8`-плейлиста;
+- при необходимости: `-OutputFile`, `-MaxSizeMB`, `-MinBitrateKbps`.
+
+Выход:
+- `.mp3`-файл на диске.
+
+Минимальный запуск:
+
+```powershell
+./prepare-audio.ps1 "https://example.com/video.m3u8"
+```
+
+### `transcribe.ps1`
+
+Служебный скрипт для отправки `.mp3` в OpenAI Audio Transcriptions API и сохранения текстовой расшифровки.
+
+Вход:
+- путь к `.mp3`-файлу;
+- при необходимости: `-WithDiarization`.
+
+Выход:
+- `.txt`-файл рядом с исходным `.mp3`.
+
+Минимальный запуск:
+
+```powershell
+./transcribe.ps1 .\audio\example.mp3
+```

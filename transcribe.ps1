@@ -19,6 +19,32 @@
 # Fail fast on any non-terminating error so that we do not silently continue
 # after partial failures (for example, network issues or malformed JSON).
 $ErrorActionPreference = "Stop"
+$transcribeProgressId = 7301
+
+function Write-TranscribeLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    Write-Host ("[Transcribe] {0}" -f $Message)
+}
+
+function Set-TranscribeProgress {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Status,
+
+        [Parameter(Mandatory = $true)]
+        [int]$PercentComplete
+    )
+
+    Write-Progress -Id $transcribeProgressId -Activity "Transcribe audio" -Status $Status -PercentComplete $PercentComplete
+}
+
+function Complete-TranscribeProgress {
+    Write-Progress -Id $transcribeProgressId -Activity "Transcribe audio" -Completed
+}
 
 function Get-AudioDurationSeconds {
     param(
@@ -94,6 +120,16 @@ function Split-AudioIntoChunks {
     return $chunks
 }
 
+function Format-DurationSeconds {
+    param(
+        [Parameter(Mandatory = $true)]
+        [double]$Seconds
+    )
+
+    $ts = [System.TimeSpan]::FromSeconds($Seconds)
+    return $ts.ToString("hh\:mm\:ss")
+}
+
 function Invoke-Transcription {
     param(
         [Parameter(Mandatory = $true)]
@@ -116,6 +152,14 @@ function Invoke-Transcription {
     $fileStream = $null
 
     try {
+        $labelForLog = if ([string]::IsNullOrWhiteSpace($ChunkLabel)) {
+            [System.IO.Path]::GetFileName($AudioPath)
+        }
+        else {
+            $ChunkLabel
+        }
+
+        Write-TranscribeLog ("Starting upload: {0}" -f $labelForLog)
         $fileStream = [System.IO.File]::OpenRead($AudioPath)
         $fileName = [System.IO.Path]::GetFileName($AudioPath)
 
@@ -131,6 +175,7 @@ function Invoke-Transcription {
             $multipart.Add([System.Net.Http.StringContent]::new("true"), "diarization")
         }
 
+        Write-TranscribeLog ("Waiting for API response: {0}" -f $labelForLog)
         $response = $HttpClient.PostAsync("https://api.openai.com/v1/audio/transcriptions", $multipart).GetAwaiter().GetResult()
         $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         if (-not $response.IsSuccessStatusCode) {
@@ -143,6 +188,7 @@ function Invoke-Transcription {
             throw "API response does not contain 'text'`n$responseBody"
         }
 
+        Write-TranscribeLog ("API response received: {0}" -f $labelForLog)
         return $json.text
     }
     finally {
@@ -152,6 +198,8 @@ function Invoke-Transcription {
 }
 
 try {
+    Set-TranscribeProgress -Status "Preparing input" -PercentComplete 5
+    Write-TranscribeLog "Preparing transcription request"
     # Tolerate diarization flags passed as free-form arguments.
     # This helps when users copy commands from terminals where line wrapping
     # or shell specifics may alter how a switch is tokenized.
@@ -167,6 +215,7 @@ try {
     # Verify that the user-provided path exists before resolving it.
     # Using -LiteralPath avoids wildcard expansion and treats the string as-is.
     if (-not (Test-Path -LiteralPath $InputFile)) {
+        Complete-TranscribeProgress
         throw "Input file not found: $InputFile"
     }
 
@@ -178,6 +227,7 @@ try {
     # Keep validation strict to avoid accidental uploads of unsupported formats.
     # If needed, this block can be extended to support additional audio types.
     if ($extension -ne ".mp3") {
+        Complete-TranscribeProgress
         throw "Expected .mp3 file, got: $extension"
     }
 
@@ -185,6 +235,7 @@ try {
     # in source code, scripts, or command history.
     $apiKey = $env:OPENAI_API_KEY
     if ([string]::IsNullOrWhiteSpace($apiKey)) {
+        Complete-TranscribeProgress
         throw "Environment variable OPENAI_API_KEY is not set"
     }
 
@@ -196,10 +247,14 @@ try {
     # Keep chunk duration slightly below the API limit to avoid boundary/rounding
     # drift (e.g. 1400.004s) when ffmpeg creates segments.
     $safeChunkDurationSeconds = 1390.0
+    # Experimental safety threshold for gpt-4o transcribe single-file uploads.
+    # Long uploads above this threshold are split locally and uploaded in parts.
+    $maxStandardSingleUploadSeconds = 3300.0
 
     # Use a default lightweight model, but allow an explicit diarization mode.
     # This keeps default cost/performance behavior unchanged for existing users.
     $model = if ($WithDiarization) { "gpt-4o-transcribe" } else { "gpt-4o-mini-transcribe" }
+    Write-TranscribeLog ("Using model: {0}" -f $model)
 
     # Ensure System.Net.Http types are available in the current PowerShell session.
     Add-Type -AssemblyName System.Net.Http
@@ -213,39 +268,74 @@ try {
     $tempDir = $null
     try {
         $allTexts = [System.Collections.Generic.List[string]]::new()
+        Set-TranscribeProgress -Status "Detecting audio duration" -PercentComplete 15
+        Write-TranscribeLog ("Resolving input file: {0}" -f $fullInputPath)
+        $duration = Get-AudioDurationSeconds -FilePath $fullInputPath
+        Write-TranscribeLog ("Audio duration: {0} ({1:N3} sec)" -f (Format-DurationSeconds -Seconds $duration), $duration)
 
         if ($WithDiarization) {
-            $duration = Get-AudioDurationSeconds -FilePath $fullInputPath
-
             if ($duration -gt $maxDiarizationDurationSeconds) {
                 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N"))
                 [System.IO.Directory]::CreateDirectory($tempDir) | Out-Null
 
+                Set-TranscribeProgress -Status "Splitting audio for diarization" -PercentComplete 25
+                Write-TranscribeLog "Audio is too long for single diarization request; splitting into chunks"
                 $chunks = Split-AudioIntoChunks -InputPath $fullInputPath -MaxChunkDuration $safeChunkDurationSeconds -TempDirectory $tempDir
+                Write-TranscribeLog ("Splitting audio for diarization: {0} part(s) with max duration {1:N0} sec" -f $chunks.Count, $safeChunkDurationSeconds)
                 for ($i = 0; $i -lt $chunks.Count; $i++) {
                     $chunk = $chunks[$i]
                     $chunkLabel = "chunk {0}/{1}" -f ($i + 1), $chunks.Count
-                    Write-Host "Uploading: $chunkLabel ($($chunk.Name))"
+                    $chunkPercent = [math]::Min(90, 35 + [math]::Floor((($i + 1) / [double]$chunks.Count) * 50))
+                    Set-TranscribeProgress -Status ("Uploading {0}" -f $chunkLabel) -PercentComplete $chunkPercent
+                    Write-TranscribeLog ("Uploading: {0} ({1})" -f $chunkLabel, $chunk.Name)
                     $chunkText = Invoke-Transcription -HttpClient $httpClient -AudioPath $chunk.FullName -Model $model -WithDiarization $true -ChunkLabel $chunkLabel
                     $allTexts.Add($chunkText)
                 }
             }
             else {
+                Set-TranscribeProgress -Status "Uploading audio for diarization" -PercentComplete 45
+                Write-TranscribeLog "Sending single diarization request"
                 $singleText = Invoke-Transcription -HttpClient $httpClient -AudioPath $fullInputPath -Model $model -WithDiarization $true
                 $allTexts.Add($singleText)
             }
         }
         else {
-            $singleText = Invoke-Transcription -HttpClient $httpClient -AudioPath $fullInputPath -Model $model -WithDiarization $false
-            $allTexts.Add($singleText)
+            if ($duration -gt $maxStandardSingleUploadSeconds) {
+                $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N"))
+                [System.IO.Directory]::CreateDirectory($tempDir) | Out-Null
+
+                Set-TranscribeProgress -Status "Splitting audio for standard transcription" -PercentComplete 25
+                Write-TranscribeLog "Audio is too long for a single request; splitting into chunks"
+                $chunks = Split-AudioIntoChunks -InputPath $fullInputPath -MaxChunkDuration $maxStandardSingleUploadSeconds -TempDirectory $tempDir
+                Write-TranscribeLog ("Splitting audio for standard transcription: {0} part(s) with max duration {1:N0} sec" -f $chunks.Count, $maxStandardSingleUploadSeconds)
+                for ($i = 0; $i -lt $chunks.Count; $i++) {
+                    $chunk = $chunks[$i]
+                    $chunkLabel = "chunk {0}/{1}" -f ($i + 1), $chunks.Count
+                    $chunkPercent = [math]::Min(90, 35 + [math]::Floor((($i + 1) / [double]$chunks.Count) * 50))
+                    Set-TranscribeProgress -Status ("Uploading {0}" -f $chunkLabel) -PercentComplete $chunkPercent
+                    Write-TranscribeLog ("Uploading: {0} ({1})" -f $chunkLabel, $chunk.Name)
+                    $chunkText = Invoke-Transcription -HttpClient $httpClient -AudioPath $chunk.FullName -Model $model -WithDiarization $false -ChunkLabel $chunkLabel
+                    $allTexts.Add($chunkText)
+                }
+            }
+            else {
+                Set-TranscribeProgress -Status "Uploading audio for transcription" -PercentComplete 45
+                Write-TranscribeLog "Sending single transcription request"
+                $singleText = Invoke-Transcription -HttpClient $httpClient -AudioPath $fullInputPath -Model $model -WithDiarization $false
+                $allTexts.Add($singleText)
+            }
         }
 
+        Set-TranscribeProgress -Status "Writing transcript to disk" -PercentComplete 95
+        Write-TranscribeLog ("Writing transcript to: {0}" -f $outputFile)
         $finalText = [string]::Join([Environment]::NewLine + [Environment]::NewLine, $allTexts)
         [System.IO.File]::WriteAllText($outputFile, $finalText, [System.Text.Encoding]::UTF8)
         $modeLabel = if ($WithDiarization) { "diarization mode" } else { "standard mode" }
-        Write-Host "Done: $outputFile ($modeLabel, model=$model)"
+        Write-TranscribeLog "Done: $outputFile ($modeLabel, model=$model)"
+        Set-TranscribeProgress -Status "Transcription completed" -PercentComplete 100
     }
     finally {
+        Complete-TranscribeProgress
         if ($tempDir -and (Test-Path -LiteralPath $tempDir)) {
             Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         }
@@ -253,6 +343,7 @@ try {
     }
 }
 catch {
+    Complete-TranscribeProgress
     # Surface only the core exception message for cleaner CLI output.
     Write-Error $_.Exception.Message
     exit 1
