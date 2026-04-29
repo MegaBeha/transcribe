@@ -1,6 +1,16 @@
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [string]$Source
+    [string]$Source,
+
+    [Parameter(Mandatory = $false)]
+    [Alias("Diarization", "SpeakerDiarization", "wd")]
+    [switch]$WithDiarization,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Save,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DebugNative
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,6 +69,29 @@ function Get-ScriptPath {
     return $path
 }
 
+function Get-SupportedVideoExtensions {
+    return @(".webm", ".mp4", ".mkv", ".mov", ".avi", ".m4v", ".wmv")
+}
+
+function Get-SupportedLocalFileDescription {
+    $videoExtensions = (Get-SupportedVideoExtensions) -join ", "
+    return ".mp3 or video file ($videoExtensions)"
+}
+
+function Get-RequiredCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $command) {
+        throw "$Name is required, but it was not found in PATH"
+    }
+
+    return $command.Source
+}
+
 function Get-InputKind {
     param(
         [Parameter(Mandatory = $true)]
@@ -68,14 +101,21 @@ function Get-InputKind {
     if (Test-Path -LiteralPath $Value) {
         $resolvedPath = (Resolve-Path -LiteralPath $Value).Path
         $extension = [System.IO.Path]::GetExtension($resolvedPath).ToLowerInvariant()
-        if ($extension -ne ".mp3") {
-            throw "Unsupported local file type: expected .mp3, got '$extension'"
+        if ($extension -eq ".mp3") {
+            return @{
+                Kind = "mp3"
+                Value = $resolvedPath
+            }
         }
 
-        return @{
-            Kind = "mp3"
-            Value = $resolvedPath
+        if ((Get-SupportedVideoExtensions) -contains $extension) {
+            return @{
+                Kind = "video"
+                Value = $resolvedPath
+            }
         }
+
+        throw "Unsupported local file type: expected $(Get-SupportedLocalFileDescription), got '$extension'"
     }
 
     $uri = $null
@@ -103,7 +143,7 @@ function Get-InputKind {
         throw "Local file not found: $Value"
     }
 
-    throw "Unsupported input. Expected an absolute http(s) URL or a local .mp3 file path"
+    throw "Unsupported input. Expected an absolute http(s) URL or a local $(Get-SupportedLocalFileDescription) path"
 }
 
 function Get-SafeNameFromSource {
@@ -155,6 +195,32 @@ function New-ManagedMp3Path {
     $suffix = [System.Guid]::NewGuid().ToString("N").Substring(0, 6)
     $fileName = "{0}_{1}.mp3" -f $baseName, $suffix
     return Join-Path (Get-Location).Path $fileName
+}
+
+function New-ManagedMp3PathForLocalMedia {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MediaPath
+    )
+
+    $directory = [System.IO.Path]::GetDirectoryName($MediaPath)
+    if ([string]::IsNullOrWhiteSpace($directory)) {
+        $directory = (Get-Location).Path
+    }
+
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($MediaPath)
+    $suffix = [System.Guid]::NewGuid().ToString("N").Substring(0, 6)
+    $fileName = "{0}_{1}.mp3" -f $baseName, $suffix
+    return Join-Path $directory $fileName
+}
+
+function Get-TranscriptPathForLocalMedia {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MediaPath
+    )
+
+    return [System.IO.Path]::ChangeExtension($MediaPath, ".txt")
 }
 
 function Invoke-ExtractPlaylist {
@@ -213,15 +279,80 @@ function Invoke-PrepareAudio {
     Write-PipelineLog ("Audio prepared: {0}" -f $OutputFile)
 }
 
+function Invoke-PrepareAudioFromVideo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VideoFile,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFile
+    )
+
+    $ffmpegPath = Get-RequiredCommand -Name "ffmpeg"
+    Write-PipelineLog ("Starting audio extraction from video: {0}" -f $VideoFile)
+    Write-PipelineLog ("Temporary MP3 path: {0}" -f $OutputFile)
+
+    $ffmpegArgs = @(
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-i", $VideoFile,
+        "-vn",
+        "-ac", "2",
+        "-c:a", "libmp3lame",
+        "-b:a", "48k",
+        "-write_xing", "0",
+        $OutputFile
+    )
+
+    & $ffmpegPath @ffmpegArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "ffmpeg failed to extract MP3 audio from the video file"
+    }
+
+    if (-not (Test-Path -LiteralPath $OutputFile)) {
+        throw "ffmpeg finished but did not create the MP3 file"
+    }
+
+    $item = Get-Item -LiteralPath $OutputFile
+    if ($item.Length -le 0) {
+        throw "Extracted MP3 file is empty"
+    }
+
+    Write-PipelineLog ("Audio extracted: {0}" -f $OutputFile)
+}
+
 function Invoke-Transcribe {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Mp3Path
+        [string]$Mp3Path,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$WithDiarization = $false,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Save = $false,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$DebugNative = $false
     )
 
     $scriptPath = Get-ScriptPath -FileName "transcribe.ps1"
     Write-PipelineLog ("Starting transcription for MP3: {0}" -f $Mp3Path)
-    & $scriptPath $Mp3Path
+    $transcribeArgs = @($Mp3Path)
+    if ($WithDiarization) {
+        $transcribeArgs += "-WithDiarization"
+    }
+
+    if ($Save) {
+        $transcribeArgs += "-Save"
+    }
+
+    if ($DebugNative) {
+        $transcribeArgs += "-DebugNative"
+    }
+
+    & $scriptPath @transcribeArgs
     if ($LASTEXITCODE -ne 0) {
         throw "transcribe.ps1 failed"
     }
@@ -233,6 +364,28 @@ function Invoke-Transcribe {
 
     Write-PipelineLog ("Text transcript created: {0}" -f $txtPath)
     return $txtPath
+}
+
+function Move-TranscriptToFinalPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FinalPath
+    )
+
+    if ([System.IO.Path]::GetFullPath($CurrentPath) -eq [System.IO.Path]::GetFullPath($FinalPath)) {
+        return $CurrentPath
+    }
+
+    if (Test-Path -LiteralPath $FinalPath) {
+        Remove-Item -LiteralPath $FinalPath -Force
+    }
+
+    Move-Item -LiteralPath $CurrentPath -Destination $FinalPath
+    Write-PipelineLog ("Text transcript moved to final path: {0}" -f $FinalPath)
+    return $FinalPath
 }
 
 $managedMp3Path = $null
@@ -252,6 +405,13 @@ try {
             Write-PipelineLog "Selected short pipeline: MP3 -> transcription"
             Set-PipelineProgress -Activity "Pipeline" -Status "Using provided MP3 file" -PercentComplete 25
             $mp3Path = $inputInfo.Value
+        }
+        "video" {
+            Write-PipelineLog "Selected local media pipeline: video -> audio -> transcription"
+            $managedMp3Path = New-ManagedMp3PathForLocalMedia -MediaPath $inputInfo.Value
+            Set-PipelineProgress -Activity "Pipeline" -Status "Extracting audio from video" -PercentComplete 35
+            Invoke-PrepareAudioFromVideo -VideoFile $inputInfo.Value -OutputFile $managedMp3Path
+            $mp3Path = $managedMp3Path
         }
         "playlist" {
             Write-PipelineLog "Selected short pipeline: playlist -> audio -> transcription"
@@ -275,7 +435,12 @@ try {
     }
 
     Set-PipelineProgress -Activity "Pipeline" -Status "Transcribing audio" -PercentComplete 80
-    $txtPath = Invoke-Transcribe -Mp3Path $mp3Path
+    $txtPath = Invoke-Transcribe -Mp3Path $mp3Path -WithDiarization $WithDiarization.IsPresent -Save $Save.IsPresent -DebugNative $DebugNative.IsPresent
+    if ($inputInfo.Kind -eq "video") {
+        $finalTxtPath = Get-TranscriptPathForLocalMedia -MediaPath $inputInfo.Value
+        $txtPath = Move-TranscriptToFinalPath -CurrentPath $txtPath -FinalPath $finalTxtPath
+    }
+
     Set-PipelineProgress -Activity "Pipeline" -Status "Finishing" -PercentComplete 100
     Write-PipelineLog ("Pipeline completed successfully. Result: {0}" -f $txtPath)
     Write-Output $txtPath
@@ -287,7 +452,12 @@ catch {
 finally {
     Complete-PipelineProgress
     if ($managedMp3Path -and (Test-Path -LiteralPath $managedMp3Path)) {
-        Write-PipelineLog ("Removing temporary MP3: {0}" -f $managedMp3Path)
-        Remove-Item -LiteralPath $managedMp3Path -Force -ErrorAction SilentlyContinue
+        if ($Save) {
+            Write-PipelineLog ("Keeping intermediate MP3: {0}" -f $managedMp3Path)
+        }
+        else {
+            Write-PipelineLog ("Removing temporary MP3: {0}" -f $managedMp3Path)
+            Remove-Item -LiteralPath $managedMp3Path -Force -ErrorAction SilentlyContinue
+        }
     }
 }
