@@ -37,6 +37,9 @@ $script:ApiLogDirectory = $null
 $script:ApiCommandCounter = 0
 $script:CurrentApiDebugLogPath = $null
 $script:LastApiDebugLogPath = $null
+$script:ReferenceClipMinimumSeconds = 1.2
+$script:ReferenceClipTargetSeconds = 9.5
+$script:ReferenceClipMaximumSeconds = 10.0
 
 function Write-TranscribeLog {
     param(
@@ -1131,12 +1134,12 @@ function Select-ReferenceSegmentForSpeaker {
         $start = [double]$segment.start
         $end = [double]$segment.end
         $duration = $end - $start
-        if ($duration -lt 2.0) {
+        if ($duration -lt $script:ReferenceClipMinimumSeconds) {
             continue
         }
 
-        $clipDuration = [math]::Min(10.0, $duration)
-        $score = [math]::Abs(10.0 - $clipDuration)
+        $clipDuration = [math]::Min($script:ReferenceClipTargetSeconds, $duration)
+        $score = [math]::Abs($script:ReferenceClipTargetSeconds - $clipDuration)
         if ($score -lt $bestScore) {
             $bestScore = $score
             $best = [pscustomobject]@{
@@ -1169,30 +1172,61 @@ function Export-SpeakerReferenceClip {
         throw "ffmpeg is required to export speaker reference clips, but it was not found in PATH"
     }
 
-    $ffmpegArgs = @(
-        "-hide_banner",
-        "-loglevel", "error",
-        "-y",
-        "-ss", ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $Start)),
-        "-t", ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $Duration)),
-        "-i", $ChunkAudioPath,
-        "-vn",
-        "-ac", "1",
-        "-c:a", "libmp3lame",
-        "-b:a", "64k",
-        "-write_xing", "0",
-        $OutputPath
-    )
+    $requestedDuration = [math]::Min($Duration, $script:ReferenceClipTargetSeconds)
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if ($requestedDuration -lt $script:ReferenceClipMinimumSeconds) {
+            Write-TranscribeLog ("Skipping speaker reference export: requested duration {0:N3} sec is below minimum {1:N1} sec" -f $requestedDuration, $script:ReferenceClipMinimumSeconds)
+            return $null
+        }
 
-    $referenceResult = Invoke-NativeCommandCapture -FilePath $ffmpeg.Source -Arguments $ffmpegArgs
-    if ($referenceResult.ExitCode -ne 0) {
-        throw ("ffmpeg failed to export speaker reference clip:`n{0}" -f (Get-NativeCommandErrorText -Result $referenceResult))
+        Write-TranscribeLog ("Exporting speaker reference clip: requested {0:N3} sec (attempt {1})" -f $requestedDuration, $attempt)
+        $ffmpegArgs = @(
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-ss", ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $Start)),
+            "-t", ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $requestedDuration)),
+            "-i", $ChunkAudioPath,
+            "-vn",
+            "-ac", "1",
+            "-c:a", "libmp3lame",
+            "-b:a", "64k",
+            "-write_xing", "0",
+            $OutputPath
+        )
+
+        $referenceResult = Invoke-NativeCommandCapture -FilePath $ffmpeg.Source -Arguments $ffmpegArgs
+        if ($referenceResult.ExitCode -ne 0) {
+            throw ("ffmpeg failed to export speaker reference clip:`n{0}" -f (Get-NativeCommandErrorText -Result $referenceResult))
+        }
+
+        $item = Get-Item -LiteralPath $OutputPath
+        if ($item.Length -le 0) {
+            throw "Speaker reference clip is empty: $OutputPath"
+        }
+
+        $actualDuration = Get-AudioDurationSeconds -FilePath $OutputPath
+        Write-TranscribeLog ("Speaker reference clip duration: requested {0:N3} sec; actual {1:N3} sec" -f $requestedDuration, $actualDuration)
+        if ($actualDuration -ge $script:ReferenceClipMinimumSeconds -and $actualDuration -le $script:ReferenceClipMaximumSeconds) {
+            return [pscustomobject]@{
+                Path = $OutputPath
+                RequestedDuration = $requestedDuration
+                ActualDuration = $actualDuration
+            }
+        }
+
+        if ($actualDuration -gt $script:ReferenceClipMaximumSeconds) {
+            $requestedDuration -= 0.25
+            Write-TranscribeLog ("Speaker reference clip is too long ({0:N3} sec); retrying with {1:N3} sec" -f $actualDuration, $requestedDuration)
+            continue
+        }
+
+        Write-TranscribeLog ("Skipping speaker reference export: actual duration {0:N3} sec is below minimum {1:N1} sec" -f $actualDuration, $script:ReferenceClipMinimumSeconds)
+        return $null
     }
 
-    $item = Get-Item -LiteralPath $OutputPath
-    if ($item.Length -le 0) {
-        throw "Speaker reference clip is empty: $OutputPath"
-    }
+    Write-TranscribeLog ("Skipping speaker reference export: failed to create a valid clip under {0:N1} sec" -f $script:ReferenceClipMaximumSeconds)
+    return $null
 }
 
 function Update-SpeakerReferences {
@@ -1245,16 +1279,22 @@ function Update-SpeakerReferences {
 
         $referenceName = Get-ReferenceNameForDisplaySpeaker -DisplaySpeaker $displaySpeaker
         $referencePath = Join-Path $TempDirectory ("reference_{0}.mp3" -f $referenceName)
-        Export-SpeakerReferenceClip -ChunkAudioPath $ChunkAudioPath -Start $referenceSegment.Start -Duration $referenceSegment.Duration -OutputPath $referencePath
+        $exportedReference = Export-SpeakerReferenceClip -ChunkAudioPath $ChunkAudioPath -Start $referenceSegment.Start -Duration $referenceSegment.Duration -OutputPath $referencePath
+        if (-not $exportedReference) {
+            Write-TranscribeLog ("Skipping reference for {0}: exported clip duration is outside {1:N1}-{2:N1} sec" -f $displaySpeaker, $script:ReferenceClipMinimumSeconds, $script:ReferenceClipMaximumSeconds)
+            continue
+        }
+
         $dataUrl = Get-DataUrlForAudioFile -Path $referencePath
         $SpeakerReferences.Add([pscustomobject]@{
             Name = $referenceName
             DisplaySpeaker = $displaySpeaker
             Path = $referencePath
             DataUrl = $dataUrl
+            Duration = $exportedReference.ActualDuration
         })
         $SpeakerMap[$referenceName] = $displaySpeaker
-        Write-TranscribeLog ("Created speaker reference: {0} -> {1}" -f $referenceName, $displaySpeaker)
+        Write-TranscribeLog ("Created speaker reference: {0} -> {1} ({2:N3} sec)" -f $referenceName, $displaySpeaker, $exportedReference.ActualDuration)
     }
 }
 
